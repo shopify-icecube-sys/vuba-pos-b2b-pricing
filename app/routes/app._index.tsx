@@ -25,8 +25,13 @@ export default function Index() {
       </s-section>
       <s-section heading="POS setup">
         <s-paragraph>
-          In the Shopify POS app: home screen → Add tile → Apps → Apply B2B
-          pricing.
+          Shopify admin → Point of Sale → Edit Point of Sale → Smart grid
+          template → Add tile → Embedded Apps → vuba-pos-b2b-pricing → Save.
+        </s-paragraph>
+        <s-paragraph>
+          The POS device must be logged in by a user whose store role includes
+          access to this app (plus the POS device setup role). Otherwise the
+          tile shows a 401 error.
         </s-paragraph>
       </s-section>
     </s-page>
