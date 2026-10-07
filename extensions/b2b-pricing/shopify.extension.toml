@@ -1,0 +1,19 @@
+api_version = "2026-07"
+
+[[extensions]]
+type = "ui_extension"
+# Change the merchant-facing name of the extension in locales/en.default.json
+name = "t:name"
+uid = "091e0132-a578-b108-d25f-28c728d5c2b193b7b351"
+handle = "b2b-pricing"
+description = "Applies the customer's B2B catalog price to POS cart lines"
+
+# module: file that contains your extension’s source code
+# target: location where your extension appears in POS
+[[extensions.targeting]]
+module = "./src/Tile.tsx"
+target = "pos.home.tile.render"
+
+[[extensions.targeting]]
+module = "./src/Modal.tsx"
+target = "pos.home.modal.render"
