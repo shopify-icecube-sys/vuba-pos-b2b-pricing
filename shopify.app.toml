@@ -11,7 +11,7 @@ scopes = "read_customers,read_companies,read_products"
 
 
 [access.admin]
-# POS extension calls the Admin API with the app's own (read-only) token,
+# POS extension calls the Admin API with the app's own (read-only) token,test
 # not the POS staff member's online token.
 direct_api_mode = "offline"
 
