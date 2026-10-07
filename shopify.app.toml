@@ -1,7 +1,7 @@
 # Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
 
 client_id = "cde760b8ba56ba8f0d4e5e54174727d4"
-application_url = "https://example.com"
+application_url = "https://vubapos.icecubedev.com"
 embedded = true
 name = "vuba-pos-b2b-pricing"
 
@@ -27,7 +27,11 @@ api_version = "2026-10"
   topics = [ "app/scopes_update" ]
 
 [auth]
-redirect_urls = [ "https://example.com/api/auth" ]
+redirect_urls = [
+  "https://vubapos.icecubedev.com/api/auth",
+  "https://vubapos.icecubedev.com/api/auth/callback",
+  "https://vubapos.icecubedev.com/auth/callback"
+]
 
 [build]
 automatically_update_urls_on_dev = true
