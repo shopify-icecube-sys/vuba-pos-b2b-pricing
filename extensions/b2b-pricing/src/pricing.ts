@@ -1,7 +1,7 @@
 // B2B catalog pricing for the POS cart.
 //
-// POS ignores B2B catalogs, so we read the catalog price ourselves with
-// productVariant.contextualPricing(companyLocationId) and apply
+// POS ignores B2B catalogs, so we read the company location's catalog prices
+// ourselves (most expensive catalog wins, see below) and apply
 // (POS price - catalog price) as a per-unit FixedAmount line-item discount.
 // All money maths is done in integer pence to avoid float rounding errors.
 
@@ -39,6 +39,7 @@ export interface PricedLine {
   perUnitDiscountPence: number;
   status: LineStatus;
   hasOtherDiscount: boolean;
+  catalogTitle: string | null; // catalog the B2B price came from
 }
 
 interface GraphqlResponse<T> {
@@ -118,8 +119,218 @@ export async function getCompanyLocations(
   return options;
 }
 
-const CATALOG_PRICES_QUERY = `#graphql
-  query CatalogPrices($ids: [ID!]!, $companyLocationId: ID!) {
+// ---------------------------------------------------------------------------
+// Catalog pricing
+//
+// Business rule (agreed with Vuba, Oct 2026): when a company location has more
+// than one catalog (e.g. "PT1A" + "PT1A Online Ordering"), use the price from
+// the MORE EXPENSIVE catalog. With a single catalog, use that catalog's price.
+// A catalog only counts for a product if the product is published to it.
+// (Shopify's own contextualPricing returns the LOWEST price, so it is only used
+// as a fallback when the location has no usable catalog.)
+// ---------------------------------------------------------------------------
+
+interface PriceBreak {
+  minimumQuantity: number;
+  pence: number;
+}
+
+/** One catalog's price for a variant. */
+interface CatalogOption {
+  catalogTitle: string;
+  basePence: number;
+  breaks: PriceBreak[];
+}
+
+const toPence = (amount: string | number) => Math.round(Number(amount) * 100);
+
+/** Unit price for a quantity, honouring volume price breaks. */
+function unitPenceForQuantity(
+  basePence: number,
+  breaks: PriceBreak[],
+  quantity: number,
+) {
+  let pence = basePence;
+  let bestMin = 0;
+  for (const b of breaks) {
+    if (quantity >= b.minimumQuantity && b.minimumQuantity > bestMin) {
+      bestMin = b.minimumQuantity;
+      pence = b.pence;
+    }
+  }
+  return pence;
+}
+
+const LOCATION_CATALOGS_QUERY = `#graphql
+  query LocationCatalogs($id: ID!) {
+    companyLocation(id: $id) {
+      catalogs(first: 20) {
+        nodes {
+          id
+          title
+          status
+          priceList { id currency }
+          publication { id }
+        }
+      }
+    }
+  }
+`;
+
+interface LocationCatalogsData {
+  companyLocation: {
+    catalogs: {
+      nodes: {
+        id: string;
+        title: string;
+        status: string;
+        priceList: {id: string; currency: string} | null;
+        publication: {id: string} | null;
+      }[];
+    };
+  } | null;
+}
+
+interface RawPrice {
+  variant: {id: string};
+  price: {amount: string};
+  quantityPriceBreaks: {
+    nodes: {minimumQuantity: number; price: {amount: string}}[];
+  };
+}
+
+const variantNumericId = (gid: string) => Number(gid.split('/').pop());
+
+/**
+ * Per variant: the price in every active catalog of the location that
+ * includes the product. Returns null when the location has no active catalog
+ * (caller then falls back to contextualPricing).
+ */
+async function getPerCatalogPricing(
+  variantIds: number[],
+  companyLocationId: string,
+  currency: string,
+): Promise<Map<number, CatalogOption[]> | null> {
+  const catalogData = await adminGraphql<LocationCatalogsData>(
+    LOCATION_CATALOGS_QUERY,
+    {id: companyLocationId},
+  );
+  const catalogs = (catalogData.companyLocation?.catalogs.nodes ?? []).filter(
+    (c) =>
+      c.status === 'ACTIVE' &&
+      (!c.priceList || c.priceList.currency === currency),
+  );
+  if (!catalogs.length) return null;
+
+  // One query: variant base prices + "is the product in catalog i?" + each
+  // catalog's price-list prices for the cart variants. Aliases c0, c1... per
+  // catalog; IDs go in as variables.
+  const varDefs = ['$ids: [ID!]!'];
+  const vars: Record<string, unknown> = {
+    ids: variantIds.map((id) => `gid://shopify/ProductVariant/${id}`),
+  };
+  if (catalogs.some((c) => c.priceList)) {
+    // GraphQL rejects declared-but-unused variables, so only add $q when a
+    // price list block will use it.
+    varDefs.push('$q: String!');
+    vars.q = variantIds.map((id) => `variant_id:${id}`).join(' OR ');
+  }
+  const publishedFields: string[] = [];
+  const priceListFields: string[] = [];
+  catalogs.forEach((c, i) => {
+    if (c.publication) {
+      varDefs.push(`$pub${i}: ID!`);
+      vars[`pub${i}`] = c.publication.id;
+      publishedFields.push(`p${i}: publishedOnPublication(publicationId: $pub${i})`);
+    }
+    if (c.priceList) {
+      varDefs.push(`$pl${i}: ID!`);
+      vars[`pl${i}`] = c.priceList.id;
+      priceListFields.push(`
+        c${i}: priceList(id: $pl${i}) {
+          prices(first: 250, query: $q) {
+            nodes {
+              variant { id }
+              price { amount }
+              quantityPriceBreaks(first: 20) {
+                nodes { minimumQuantity price { amount } }
+              }
+            }
+          }
+        }`);
+    }
+  });
+
+  const query = `#graphql
+    query PerCatalogPrices(${varDefs.join(', ')}) {
+      variants: nodes(ids: $ids) {
+        ... on ProductVariant {
+          id
+          price
+          product { id ${publishedFields.join(' ')} }
+        }
+      }
+      ${priceListFields.join('\n')}
+    }
+  `;
+
+  type Data = {
+    variants: ({
+      id: string;
+      price: string;
+      product: Record<string, unknown>;
+    } | null)[];
+  } & Record<string, {prices: {nodes: RawPrice[]}} | unknown>;
+
+  const data = await adminGraphql<Data>(query, vars);
+
+  // catalog index -> variant id -> price row
+  const rowsByCatalog = catalogs.map((_, i) => {
+    const rows = new Map<number, RawPrice>();
+    const block = data[`c${i}`] as {prices: {nodes: RawPrice[]}} | undefined;
+    for (const row of block?.prices.nodes ?? []) {
+      rows.set(variantNumericId(row.variant.id), row);
+    }
+    return rows;
+  });
+
+  const result = new Map<number, CatalogOption[]>();
+  for (const variant of data.variants) {
+    if (!variant) continue;
+    const variantId = variantNumericId(variant.id);
+    const options: CatalogOption[] = [];
+    catalogs.forEach((catalog, i) => {
+      // Product must be published to the catalog (if it has a publication).
+      if (catalog.publication && variant.product[`p${i}`] !== true) return;
+      const row = rowsByCatalog[i].get(variantId);
+      if (row) {
+        options.push({
+          catalogTitle: catalog.title,
+          basePence: toPence(row.price.amount),
+          breaks: row.quantityPriceBreaks.nodes.map((b) => ({
+            minimumQuantity: b.minimumQuantity,
+            pence: toPence(b.price.amount),
+          })),
+        });
+      } else if (!catalog.priceList) {
+        // Catalog without a price list sells at the normal variant price.
+        options.push({
+          catalogTitle: catalog.title,
+          basePence: toPence(variant.price),
+          breaks: [],
+        });
+      }
+      // Price list exists but returned no row for this variant: skip it
+      // rather than guess.
+    });
+    result.set(variantId, options);
+  }
+  return result;
+}
+
+// Fallback: Shopify's resolved price for the location (lowest across catalogs).
+const CONTEXTUAL_PRICES_QUERY = `#graphql
+  query ContextualPrices($ids: [ID!]!, $companyLocationId: ID!) {
     nodes(ids: $ids) {
       ... on ProductVariant {
         id
@@ -134,7 +345,7 @@ const CATALOG_PRICES_QUERY = `#graphql
   }
 `;
 
-interface CatalogPricesData {
+interface ContextualPricesData {
   nodes: ({
     id: string;
     contextualPricing: {
@@ -146,48 +357,32 @@ interface CatalogPricesData {
   } | null)[];
 }
 
-interface VariantPricing {
-  basePence: number;
-  breaks: {minimumQuantity: number; pence: number}[];
-}
-
-const toPence = (amount: string | number) => Math.round(Number(amount) * 100);
-
-async function getCatalogPricing(
+async function getContextualPricing(
   variantIds: number[],
   companyLocationId: string,
-): Promise<Map<number, VariantPricing>> {
-  const result = new Map<number, VariantPricing>();
-  if (!variantIds.length) return result;
-  const data = await adminGraphql<CatalogPricesData>(CATALOG_PRICES_QUERY, {
-    ids: variantIds.map((id) => `gid://shopify/ProductVariant/${id}`),
-    companyLocationId,
-  });
+): Promise<Map<number, CatalogOption[]>> {
+  const data = await adminGraphql<ContextualPricesData>(
+    CONTEXTUAL_PRICES_QUERY,
+    {
+      ids: variantIds.map((id) => `gid://shopify/ProductVariant/${id}`),
+      companyLocationId,
+    },
+  );
+  const result = new Map<number, CatalogOption[]>();
   for (const node of data.nodes) {
     if (!node?.contextualPricing) continue;
-    const numericId = Number(node.id.split('/').pop());
-    result.set(numericId, {
-      basePence: toPence(node.contextualPricing.price.amount),
-      breaks: node.contextualPricing.quantityPriceBreaks.nodes.map((b) => ({
-        minimumQuantity: b.minimumQuantity,
-        pence: toPence(b.price.amount),
-      })),
-    });
+    result.set(variantNumericId(node.id), [
+      {
+        catalogTitle: 'Catalog',
+        basePence: toPence(node.contextualPricing.price.amount),
+        breaks: node.contextualPricing.quantityPriceBreaks.nodes.map((b) => ({
+          minimumQuantity: b.minimumQuantity,
+          pence: toPence(b.price.amount),
+        })),
+      },
+    ]);
   }
   return result;
-}
-
-/** Catalog unit price for a quantity, honouring volume price breaks. */
-function unitPenceForQuantity(pricing: VariantPricing, quantity: number) {
-  let pence = pricing.basePence;
-  let bestMin = 0;
-  for (const b of pricing.breaks) {
-    if (quantity >= b.minimumQuantity && b.minimumQuantity > bestMin) {
-      bestMin = b.minimumQuantity;
-      pence = b.pence;
-    }
-  }
-  return pence;
 }
 
 const isOurDiscount = (d: {discountDescription?: string}) =>
@@ -197,6 +392,7 @@ const isOurDiscount = (d: {discountDescription?: string}) =>
 export async function priceCartLines(
   lines: CartLine[],
   companyLocationId: string,
+  currency: string,
 ): Promise<PricedLine[]> {
   const variantIds = [
     ...new Set(
@@ -205,7 +401,10 @@ export async function priceCartLines(
         .map((l) => l.variantId as number),
     ),
   ];
-  const pricing = await getCatalogPricing(variantIds, companyLocationId);
+  const pricing = variantIds.length
+    ? ((await getPerCatalogPricing(variantIds, companyLocationId, currency)) ??
+      (await getContextualPricing(variantIds, companyLocationId)))
+    : new Map<number, CatalogOption[]>();
 
   return lines.map((line) => {
     const base = {
@@ -213,6 +412,7 @@ export async function priceCartLines(
       title: line.title ?? 'Item',
       quantity: line.quantity,
       hasOtherDiscount: line.discounts.some((d) => !isOurDiscount(d)),
+      catalogTitle: null as string | null,
     };
     if (!line.variantId || line.isGiftCard || line.price == null) {
       return {
@@ -224,8 +424,8 @@ export async function priceCartLines(
       };
     }
     const posPence = toPence(line.price);
-    const variantPricing = pricing.get(line.variantId);
-    if (!variantPricing) {
+    const options = pricing.get(line.variantId) ?? [];
+    if (!options.length) {
       return {
         ...base,
         posPence,
@@ -234,10 +434,24 @@ export async function priceCartLines(
         status: 'no-price' as const,
       };
     }
-    const b2bPence = unitPenceForQuantity(variantPricing, line.quantity);
+    // Most expensive catalog wins (for this line's quantity).
+    let chosen = options[0];
+    let b2bPence = -1;
+    for (const option of options) {
+      const pence = unitPenceForQuantity(
+        option.basePence,
+        option.breaks,
+        line.quantity,
+      );
+      if (pence > b2bPence) {
+        b2bPence = pence;
+        chosen = option;
+      }
+    }
     const diff = posPence - b2bPence;
     return {
       ...base,
+      catalogTitle: chosen.catalogTitle,
       posPence,
       b2bPence,
       perUnitDiscountPence: Math.max(diff, 0),

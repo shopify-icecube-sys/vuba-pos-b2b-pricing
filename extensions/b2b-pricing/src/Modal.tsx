@@ -48,6 +48,7 @@ function Extension() {
       const lines = await priceCartLines(
         shopify.cart.current.value.lineItems,
         location.companyLocationId,
+        currency,
       );
       setState({step: 'preview', location, lines});
     } catch (error) {
@@ -208,6 +209,13 @@ function Extension() {
                         currency,
                       )}
                     </s-text>
+                    {l.catalogTitle && (
+                      <s-text color="subdued">
+                        Catalog: {l.catalogTitle}
+                        {l.status === 'higher' &&
+                          ` (${formatPence(l.b2bPence, currency)})`}
+                      </s-text>
+                    )}
                     <s-badge tone={STATUS_BADGE[l.status].tone}>
                       {STATUS_BADGE[l.status].label}
                     </s-badge>
