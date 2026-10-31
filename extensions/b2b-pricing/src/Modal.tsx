@@ -10,10 +10,33 @@ import {
   getCompanyLocations,
   priceCartLines,
 } from './pricing';
+import {
+  isUnauthorized,
+  serverGetCompanyLocations,
+  serverPriceCartLines,
+} from './server';
 
 export default async () => {
   render(<Extension />, document.body);
 };
+
+// Once direct API access returns 401 on this device, go straight to the app
+// server for the rest of the session (see server.ts).
+let useServer = false;
+
+async function withFallback<T>(
+  direct: () => Promise<T>,
+  viaServer: () => Promise<T>,
+): Promise<T> {
+  if (useServer) return viaServer();
+  try {
+    return await direct();
+  } catch (error) {
+    if (!isUnauthorized(error)) throw error;
+    useServer = true;
+    return viaServer();
+  }
+}
 
 type State =
   | {step: 'loading'; message: string}
@@ -41,14 +64,21 @@ function Extension() {
   });
   const [applying, setApplying] = useState(false);
   const currency = shopify.session.currentSession.currency;
+  const shopDomain = shopify.session.currentSession.shopDomain;
 
   async function loadPreview(location: CompanyLocationOption) {
     setState({step: 'loading', message: 'Fetching catalog prices…'});
     try {
-      const lines = await priceCartLines(
-        shopify.cart.current.value.lineItems,
-        location.companyLocationId,
-        currency,
+      const cartLines = shopify.cart.current.value.lineItems;
+      const lines = await withFallback(
+        () => priceCartLines(cartLines, location.companyLocationId, currency),
+        () =>
+          serverPriceCartLines(
+            shopDomain,
+            cartLines,
+            location.companyLocationId,
+            currency,
+          ),
       );
       setState({step: 'preview', location, lines});
     } catch (error) {
@@ -64,7 +94,10 @@ function Extension() {
         return;
       }
       try {
-        const locations = await getCompanyLocations(customer.id);
+        const locations = await withFallback(
+          () => getCompanyLocations(customer.id),
+          () => serverGetCompanyLocations(shopDomain, customer.id),
+        );
         if (locations.length === 0) setState({step: 'no-company'});
         else if (locations.length === 1) await loadPreview(locations[0]);
         else setState({step: 'choose-location', locations});

@@ -47,7 +47,21 @@ interface GraphqlResponse<T> {
   errors?: {message: string}[];
 }
 
-async function adminGraphql<T>(
+/**
+ * Runs an Admin GraphQL query and returns `data`. Two implementations:
+ * - `adminGraphql` (below): POS direct API access from the extension. It acts
+ *   as the user who logged the POS device in, so it returns 401 when that
+ *   user's store role lacks this app.
+ * - the app server (`app/routes/api.pos.tsx`): uses the app's own offline
+ *   token, so it works whoever is logged into the device.
+ * The pricing functions take one as a parameter so both run the same logic.
+ */
+export type Gql = <T>(
+  query: string,
+  variables: Record<string, unknown>,
+) => Promise<T>;
+
+export async function adminGraphql<T>(
   query: string,
   variables: Record<string, unknown>,
 ): Promise<T> {
@@ -98,8 +112,9 @@ interface CustomerCompaniesData {
 /** All company locations the POS customer can buy for (empty = not B2B). */
 export async function getCompanyLocations(
   customerId: number,
+  gql: Gql = adminGraphql,
 ): Promise<CompanyLocationOption[]> {
-  const data = await adminGraphql<CustomerCompaniesData>(
+  const data = await gql<CustomerCompaniesData>(
     CUSTOMER_COMPANIES_QUERY,
     {id: `gid://shopify/Customer/${customerId}`},
   );
@@ -210,8 +225,9 @@ async function getPerCatalogPricing(
   variantIds: number[],
   companyLocationId: string,
   currency: string,
+  gql: Gql,
 ): Promise<Map<number, CatalogOption[]> | null> {
-  const catalogData = await adminGraphql<LocationCatalogsData>(
+  const catalogData = await gql<LocationCatalogsData>(
     LOCATION_CATALOGS_QUERY,
     {id: companyLocationId},
   );
@@ -282,7 +298,7 @@ async function getPerCatalogPricing(
     } | null)[];
   } & Record<string, {prices: {nodes: RawPrice[]}} | unknown>;
 
-  const data = await adminGraphql<Data>(query, vars);
+  const data = await gql<Data>(query, vars);
 
   // catalog index -> variant id -> price row
   const rowsByCatalog = catalogs.map((_, i) => {
@@ -360,8 +376,9 @@ interface ContextualPricesData {
 async function getContextualPricing(
   variantIds: number[],
   companyLocationId: string,
+  gql: Gql,
 ): Promise<Map<number, CatalogOption[]>> {
-  const data = await adminGraphql<ContextualPricesData>(
+  const data = await gql<ContextualPricesData>(
     CONTEXTUAL_PRICES_QUERY,
     {
       ids: variantIds.map((id) => `gid://shopify/ProductVariant/${id}`),
@@ -393,6 +410,7 @@ export async function priceCartLines(
   lines: CartLine[],
   companyLocationId: string,
   currency: string,
+  gql: Gql = adminGraphql,
 ): Promise<PricedLine[]> {
   const variantIds = [
     ...new Set(
@@ -402,8 +420,12 @@ export async function priceCartLines(
     ),
   ];
   const pricing = variantIds.length
-    ? ((await getPerCatalogPricing(variantIds, companyLocationId, currency)) ??
-      (await getContextualPricing(variantIds, companyLocationId)))
+    ? ((await getPerCatalogPricing(
+        variantIds,
+        companyLocationId,
+        currency,
+        gql,
+      )) ?? (await getContextualPricing(variantIds, companyLocationId, gql)))
     : new Map<number, CatalogOption[]>();
 
   return lines.map((line) => {
