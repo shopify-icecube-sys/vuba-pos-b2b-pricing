@@ -21,13 +21,14 @@ async function call<T>(
   shop: string,
   body: Record<string, unknown>,
 ): Promise<T> {
+  // Sent as a CORS "simple request" (text/plain, no custom headers) so the
+  // browser skips the preflight: on the client's iPad (POS 11.17) the
+  // preflight got a 204 but the POST was never sent ("TypeError: Load
+  // failed"). The key travels in the body instead of an X-POS-Key header.
   const res = await fetch(`${SERVER_URL}/api/pos`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-POS-Key': POS_API_KEY,
-    },
-    body: JSON.stringify({...body, shop}),
+    headers: {'Content-Type': 'text/plain'},
+    body: JSON.stringify({...body, shop, key: POS_API_KEY}),
   });
   if (!res.ok) {
     const text = await res.text().catch(() => '');
