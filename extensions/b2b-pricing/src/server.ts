@@ -65,6 +65,7 @@ export const serverPriceCartLines = (
     })),
   });
 
-/** True for the 401 that direct API access returns without app permission. */
+/** True for the 401 that direct API access returns without app permission
+ * (kept for diagnostics; the modal now tries the server first). */
 export const isUnauthorized = (error: unknown) =>
   /\b401\b/.test(String(error));

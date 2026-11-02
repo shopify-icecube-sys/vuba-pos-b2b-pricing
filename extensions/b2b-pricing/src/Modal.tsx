@@ -11,7 +11,6 @@ import {
   priceCartLines,
 } from './pricing';
 import {
-  isUnauthorized,
   serverGetCompanyLocations,
   serverPriceCartLines,
 } from './server';
@@ -20,21 +19,24 @@ export default async () => {
   render(<Extension />, document.body);
 };
 
-// Once direct API access returns 401 on this device, go straight to the app
-// server for the rest of the session (see server.ts).
-let useServer = false;
-
+// Server first: our app server uses the app's own token, so it works no
+// matter which user logged the POS device in (direct API access returns 401
+// when that user's store role lacks this app). If the server can't be
+// reached, fall back to direct API access. If both fail, show both errors.
 async function withFallback<T>(
   direct: () => Promise<T>,
   viaServer: () => Promise<T>,
 ): Promise<T> {
-  if (useServer) return viaServer();
   try {
-    return await direct();
-  } catch (error) {
-    if (!isUnauthorized(error)) throw error;
-    useServer = true;
-    return viaServer();
+    return await viaServer();
+  } catch (serverError) {
+    try {
+      return await direct();
+    } catch (directError) {
+      throw new Error(
+        `Server: ${String(serverError)} | Direct: ${String(directError)}`,
+      );
+    }
   }
 }
 
